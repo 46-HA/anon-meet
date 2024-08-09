@@ -44,4 +44,4 @@ What foods do you like?
 Do you speak other lanauges? If so which ones
 
 
-
+*ps we should probaly have them type it in and then AI will summarize it
