@@ -1,0 +1,47 @@
+possible intrests:
+
+tech:
+
+What programming lanuages do you use?
+JS, Python, C, C++, Rust, Ruby etc
+
+What's your tech stack?
+Web Dev
+Game Dev
+AI/ML
+Cyber Secuity
+Hardware/PCBs
+Linux
+
+
+creative stuff:
+
+do you do/like:
+design
+writing
+music
+art
+
+Other ideas:
+
+More into the music part, maybe include like a spotfy intergration or add your top 5 favorite songs?
+
+Favorite games/game genres
+
+Books!!
+
+Sports/Clubs (hack club, xc, track)
+
+What hackathons did you go to?
+Trail
+Summit
+Boreal
+Outernet
+Wonderland
+
+What foods do you like?
+
+Do you speak other lanauges? If so which ones
+
+
+
