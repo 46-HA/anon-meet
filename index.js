@@ -4,21 +4,24 @@ const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 4646;
 
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-// Main Slack slash command endpoint
-app.post('/slack/commands', async (req, res) => {
-  console.log('Received command:', req.body); // Log incoming data for debugging
+// Serve static files from the /anon-meeter directory
+app.use('/anon-meeter', express.static('anon-meeter'));
 
-  const { user_id } = req.body;
+// Main Slack slash command endpoint
+app.post('/anon-meeter/slack/commands', async (req, res) => {
+  console.log('Received command:', req.body); // Log incoming data for debugging
+  
+  const { user_id } = req.body;  // Ensure you're extracting user_id correctly from the request
 
   // Send a DM to the user who triggered the command
   try {
     const response = await axios.post('https://slack.com/api/chat.postMessage', {
-      channel: user_id,
+      channel: user_id,  // Use user_id as the channel to send a direct message
       text: 'Hello! This is your form. Please fill it out.',
     }, {
       headers: {
@@ -32,6 +35,12 @@ app.post('/slack/commands', async (req, res) => {
     console.error('Error sending DM:', error.response ? error.response.data : error.message);
     res.status(500).send('Failed to send DM');
   }
+});
+
+// Test POST route for verification
+app.post('/test', (req, res) => {
+  console.log('Test POST route hit:', req.body);
+  res.send('Test POST route works!');
 });
 
 app.listen(port, () => {
