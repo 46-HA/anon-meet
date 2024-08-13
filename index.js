@@ -1,6 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -403,8 +404,31 @@ app.post('/anon-meeter/slack/interactions', async (req, res) => {
     }
 });
 
+// Function to verify Slack's request signature
+function verifySlackRequest(req) {
+    const slackSignature = req.headers['x-slack-signature'];
+    const slackRequestTimestamp = req.headers['x-slack-request-timestamp'];
+
+    // Prevent replay attacks
+    const timeDifference = Math.floor(Date.now() / 1000) - slackRequestTimestamp;
+    if (timeDifference > 300) {
+        return false;
+    }
+
+    const sigBasestring = `v0:${slackRequestTimestamp}:${JSON.stringify(req.body)}`;
+    const mySignature = 'v0=' + crypto.createHmac('sha256', process.env.SLACK_SIGNING_SECRET)
+        .update(sigBasestring, 'utf8')
+        .digest('hex');
+
+    return crypto.timingSafeEqual(Buffer.from(mySignature, 'utf8'), Buffer.from(slackSignature, 'utf8'));
+}
+
 // Route to handle Slack events
 app.post('/slack/events', async (req, res) => {
+    if (!verifySlackRequest(req)) {
+        return res.status(400).send('Verification failed');
+    }
+
     const { event } = req.body;
 
     if (event && event.type === 'message' && !event.bot_id) {
