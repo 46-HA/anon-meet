@@ -7,9 +7,26 @@ const app = express();
 const port = process.env.PORT || 4646;
 
 let allUsers = [];
+let channelPairs = {};
+let matchedPairs = new Set(); // To store already matched pairs
 
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
+
+// Function to generate a random string of lowercase letters and numbers
+function generateRandomString(length) {
+    const characters = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += characters.charAt(Math.floor(Math.random() * characters.length));
+    }
+    return result;
+}
+
+// Function to sanitize the channel name to meet Slack's requirements
+function sanitizeChannelName(name) {
+    return name.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 21); // Limit to 21 characters to be safe
+}
 
 // Function to call GPT-3.5 Turbo for scoring the match
 async function scoreMatch(user1Response, user2Response) {
@@ -46,144 +63,103 @@ async function sendToSlack(channel, text) {
     });
 }
 
-// Function to create private channels and relay messages
-async function createPrivateChannel(user1, user2) {
-    const channel1Name = `anon-meet-${user1}-${user2}-1`;
-    const channel2Name = `anon-meet-${user1}-${user2}-2`;
+// Function to create a private channel for each user and set up message relaying
+async function createPrivateChannels(user1, user2, matchInfo) {
+    // Generate unique and sanitized channel names
+    const channel1Name = sanitizeChannelName(`anon-meet-${user1}-${generateRandomString(5)}`);
+    const channel2Name = sanitizeChannelName(`anon-meet-${user2}-${generateRandomString(5)}`);
 
-    // Create channels
-    const createChannel1Response = await axios.post('https://slack.com/api/conversations.create', {
-        name: channel1Name,
-        is_private: true
-    }, {
-        headers: {
-            Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-        }
-    });
-
-    const createChannel2Response = await axios.post('https://slack.com/api/conversations.create', {
-        name: channel2Name,
-        is_private: true
-    }, {
-        headers: {
-            Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-        }
-    });
-
-    const channel1Id = createChannel1Response.data.channel.id;
-    const channel2Id = createChannel2Response.data.channel.id;
-
-    // Invite users to channels
-    await axios.post('https://slack.com/api/conversations.invite', {
-        channel: channel1Id,
-        users: `${user1},${user2}`
-    }, {
-        headers: {
-            Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-        }
-    });
-
-    await axios.post('https://slack.com/api/conversations.invite', {
-        channel: channel2Id,
-        users: `${user2},${user1}`
-    }, {
-        headers: {
-            Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-        }
-    });
-
-    // Log channel creation
-    await sendToSlack('#anon-logs', `Created channels ${channel1Name} and ${channel2Name} for users <@${user1}> and <@${user2}>.`);
-
-    // Relay messages between channels
-    const relayMessages = async (channelId, otherChannelId) => {
-        await axios.post('https://slack.com/api/chat.postMessage', {
-            channel: channelId,
-            text: `You have been matched with someone! Your messages in this channel will be relayed to the other person. Type "end" to reveal identities and end the chat.`
+    try {
+        // Create first private channel for user1
+        const createChannel1Response = await axios.post('https://slack.com/api/conversations.create', {
+            name: channel1Name,
+            is_private: true
         }, {
             headers: {
                 Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
             }
         });
 
-        // Listen for messages
-        app.post(`/slack/events/${channelId}`, async (req, res) => {
-            const { event } = req.body;
+        if (!createChannel1Response.data.ok) {
+            throw new Error(`Failed to create channel: ${createChannel1Response.data.error}`);
+        }
 
-            if (event && event.type === 'message' && event.text !== 'end') {
-                await axios.post('https://slack.com/api/chat.postMessage', {
-                    channel: otherChannelId,
-                    text: event.text
-                }, {
-                    headers: {
-                        Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                    }
-                });
-            } else if (event.text === 'end') {
-                await axios.post('https://slack.com/api/chat.postMessage', {
-                    channel: channelId,
-                    text: `The chat has ended. You were chatting with <@${user2}>.`
-                }, {
-                    headers: {
-                        Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                    }
-                });
+        const channel1Id = createChannel1Response.data.channel.id;
 
-                await axios.post('https://slack.com/api/chat.postMessage', {
-                    channel: otherChannelId,
-                    text: `The chat has ended. You were chatting with <@${user1}>.`
-                }, {
-                    headers: {
-                        Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                    }
-                });
-
-                // Archive channels
-                await axios.post('https://slack.com/api/conversations.archive', {
-                    channel: channelId
-                }, {
-                    headers: {
-                        Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                    }
-                });
-
-                await axios.post('https://slack.com/api/conversations.archive', {
-                    channel: otherChannelId
-                }, {
-                    headers: {
-                        Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                    }
-                });
+        // Create second private channel for user2
+        const createChannel2Response = await axios.post('https://slack.com/api/conversations.create', {
+            name: channel2Name,
+            is_private: true
+        }, {
+            headers: {
+                Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
             }
-
-            res.status(200).send('');
         });
 
-        // Archive channels after 12 hours of inactivity
-        setTimeout(async () => {
-            await axios.post('https://slack.com/api/conversations.archive', {
-                channel: channelId
-            }, {
-                headers: {
-                    Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                }
-            });
+        if (!createChannel2Response.data.ok) {
+            throw new Error(`Failed to create channel: ${createChannel2Response.data.error}`);
+        }
 
-            await axios.post('https://slack.com/api/conversations.archive', {
-                channel: otherChannelId
-            }, {
-                headers: {
-                    Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
-                }
-            });
+        const channel2Id = createChannel2Response.data.channel.id;
 
-            await sendToSlack('#anon-logs', `Archived channels ${channel1Name} and ${channel2Name} due to inactivity.`);
-        }, 12 * 60 * 60 * 1000); // 12 hours
-    };
+        // Invite user1 to their private channel
+        const inviteResponse1 = await axios.post('https://slack.com/api/conversations.invite', {
+            channel: channel1Id,
+            users: user1
+        }, {
+            headers: {
+                Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
+            }
+        });
 
-    // Set up message relaying
-    relayMessages(channel1Id, channel2Id);
-    relayMessages(channel2Id, channel1Id);
+        if (!inviteResponse1.data.ok) {
+            throw new Error(`Failed to invite user to channel: ${inviteResponse1.data.error}`);
+        }
+
+        // Invite user2 to their private channel
+        const inviteResponse2 = await axios.post('https://slack.com/api/conversations.invite', {
+            channel: channel2Id,
+            users: user2
+        }, {
+            headers: {
+                Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`
+            }
+        });
+
+        if (!inviteResponse2.data.ok) {
+            throw new Error(`Failed to invite user to channel: ${inviteResponse2.data.error}`);
+        }
+
+        // Log channel creation
+        await sendToSlack('#anon-logs', `Created private channels ${channel1Name} and ${channel2Name} for users <@${user1}> and <@${user2}>.`);
+
+        // DM users with match information
+        await sendToSlack(user1, `You have been matched with someone! Here is why: ${matchInfo}. Check your private channel.`);
+        await sendToSlack(user2, `You have been matched with someone! Here is why: ${matchInfo}. Check your private channel.`);
+
+        // Store channel pairs for message relaying
+        channelPairs[channel1Id] = channel2Id;
+        channelPairs[channel2Id] = channel1Id;
+
+        // Log that the bot is listening on these channels
+        console.log(`Listening on channel ${channel1Id}`);
+        console.log(`Listening on channel ${channel2Id}`);
+
+    } catch (error) {
+        console.error('Error creating private channels:', error.message);
+        throw error;
+    }
+}
+
+// Function to relay messages between the two channels
+async function relayMessages(event) {
+    const { channel, text, user } = event;
+
+    if (channelPairs[channel]) {
+        const targetChannel = channelPairs[channel];
+        console.log(`Relaying message from channel ${channel} to channel ${targetChannel}: "${text}"`);
+        await sendToSlack(targetChannel, `<@${user}> said: ${text}`);
+    }
 }
 
 // Route to handle Slack command
@@ -358,9 +334,6 @@ app.post('/anon-meeter/slack/commands', async (req, res) => {
             }
         });
 
-        // Send DM to user after form submission
-        await sendToSlack(user_id, `Hey, you submitted your form! I'll keep you updated when someone matches with you.`);
-
     } catch (error) {
         console.error('Error opening modal:', error.response ? error.response.data : error.message);
     }
@@ -400,14 +373,25 @@ app.post('/anon-meeter/slack/interactions', async (req, res) => {
             // Store the user's response
             allUsers.push({ id: payload.user.id, response: combinedResponse });
 
+            // DM the user after they submit the form
+            await sendToSlack(payload.user.id, `Hey, you submitted your form! I'll keep you updated when someone matches with you.`);
+
             // Match with all previous users
             for (const user of allUsers) {
                 if (user.id !== payload.user.id) {
+                    const matchKey = `${user.id}-${payload.user.id}`;
+                    const reverseMatchKey = `${payload.user.id}-${user.id}`;
+
+                    if (matchedPairs.has(matchKey) || matchedPairs.has(reverseMatchKey)) {
+                        continue; // Skip if these two users were already matched
+                    }
+
                     const matchContent = await scoreMatch(user.response, combinedResponse);
                     const matchPercentage = parseInt(matchContent.match(/(\d+)%/)[1], 10);
 
-                    if (matchPercentage >= 60 && matchPercentage <= 70) {
-                        await createPrivateChannel(user.id, payload.user.id);
+                    if (matchPercentage >= 60) {
+                        await createPrivateChannels(user.id, payload.user.id, matchContent);
+                        matchedPairs.add(matchKey);
                     }
 
                     await sendToSlack('#possible-connections', `Match between <@${user.id}> and <@${payload.user.id}>:\n${matchContent}`);
@@ -417,6 +401,18 @@ app.post('/anon-meeter/slack/interactions', async (req, res) => {
     } catch (error) {
         console.error('Error processing interaction:', error.message);
     }
+});
+
+// Route to handle Slack events
+app.post('/slack/events', async (req, res) => {
+    const { event } = req.body;
+
+    if (event && event.type === 'message' && !event.bot_id) {
+        console.log(`Received message in channel ${event.channel} from user <@${event.user}>: ${event.text}`);
+        await relayMessages(event);
+    }
+
+    res.status(200).send(''); // Acknowledge immediately
 });
 
 // Start the Express server
