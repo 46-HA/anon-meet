@@ -1,6 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const { saveUserResponse, getAllUserResponses } = require('./database'); // Import database functions
 require('dotenv').config();
 
 const app = express();
@@ -9,28 +10,29 @@ const port = 56503;
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const OPENAI_API_TOKEN = process.env.OPENAI_API_TOKEN;
-const ANON_LOGS_CHANNEL = '#anon-logs';
+const SLACK_BOT_TOKEN = "xoxb-{REDACTED}";
+const OPENAI_API_TOKEN = "{REDACTED}";
 const END_REACTION = 'end';
 const ARCHIVE_TIMER_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
-const ARCHIVE_AFTER_HOURS = 24; // Number of hours after which the channel will be archived
+const ARCHIVE_AFTER_HOURS = 24; // Set to 24 hours for actual use
+const ANON_MEETERS_USERGROUP = 'S07JMA8KBTM'; // User group ID for @anon-meeters
+const THE_HEN_COOP_CHANNEL_ID = 'C06D8NJKYMS'; // Replace with the actual channel ID of #the-hen-coop
 
-let allUsers = [];
 let matchedPairs = new Set(); // Track matched pairs
 let channelMapping = new Map(); // Track channels and their corresponding users
+let messageLogs = new Map(); // Store messages for each channel
 
 const questions = [
   'What programming languages do you use? (e.g., JavaScript, Python, C, etc.)',
-  'What is your technology stack? (e.g., Web Development, Game Development, AI/ML, etc.)',
-  'Do you engage in or enjoy activities like design, writing, music, or art?',
-  'Top 5 favorite songs or Spotify integration?',
-  'Favorite games/game genres?',
-  'Books you like?',
-  'Sports/Clubs (Hack Club, XC, Track)?',
+  'What is your tech stack? (e.g., Web Development, Game Development, AI/ML, etc.)',
+  'Do you engage enjoy activities like design, writing, music, or art?',
+  'What are your favorite songs/artists?',
+  'What are your favorite games/game genres?',
+  'What are some of your favorite books?',
+  'What sports/clubs are you in? (Hack Club, XC, Track)?',
   'What hackathons have you attended? (Trail, Summit, Boreal, Outernet, Wonderland)',
   'What foods do you like?',
-  'Do you speak any other languages? If so, which ones?'
+  "Do you speak any other languages? (Programming doesn't count)"
 ];
 
 app.post('/slack/commands', async (req, res) => {
@@ -38,9 +40,6 @@ app.post('/slack/commands', async (req, res) => {
   res.status(200).send(); // Acknowledge Slack command immediately
 
   if (command === '/form') {
-    // Remove previous submission if user submits form again
-    allUsers = allUsers.filter(user => user.userId !== user_id);
-
     // Create a form modal view
     const modalView = {
       type: 'modal',
@@ -90,6 +89,9 @@ app.post('/slack/commands', async (req, res) => {
       if (!response.data.ok) {
         console.error('Error opening modal:', response.data.error);
         console.error('Full response:', response.data);
+      } else {
+        // Add the user to the @anon-meeters user group
+        await addUserToUserGroup(user_id);
       }
     } catch (error) {
       console.error('Error opening modal:', error.message);
@@ -105,8 +107,13 @@ app.post('/slack/events', async (req, res) => {
     } else if (req.body.event) {
       const event = req.body.event;
       // Handle message events in channels
-      if (event.type === 'message' && !event.subtype && channelMapping.has(event.channel)) {
-        await handleMessageEvent(event);
+      if (event.type === 'message' && !event.subtype) {
+        if (channelMapping.has(event.channel)) {
+          await handleMessageEvent(event);
+        } else if (event.channel_type === 'im' && event.user === 'U062U3SQ2T1') {
+          // Check if admin requests logs
+          await handleAdminLogRequest(event);
+        }
       }
       // Handle reaction added events
       if (event.type === 'reaction_added' && event.reaction === END_REACTION) {
@@ -124,9 +131,7 @@ app.post('/slack/events', async (req, res) => {
         // Respond promptly to avoid timeouts
         res.json({ "response_action": "clear" });
 
-        allUsers.push({ userId, answers });
-
-        await logResponsesToChannel(userId, answers);
+        await saveUserResponse(userId, answers); // Save the user response to the database
         await analyzeAndLogConnections();
       } else {
         res.status(200).send(); // Default response for other actions
@@ -140,87 +145,119 @@ app.post('/slack/events', async (req, res) => {
   }
 });
 
-async function logResponsesToChannel(user_id, answers) {
-  const text = `User <@${user_id}> submitted their form:\n\n` +
-    questions.map((q, i) => `${i + 1}. ${q}\n   - ${answers[i]}`).join('\n\n');
+async function handleMessageEvent(event) {
+  const { channel, user, text, bot_id } = event;
 
-  try {
-    await axios.post(
-      'https://slack.com/api/chat.postMessage',
-      {
-        channel: ANON_LOGS_CHANNEL,
-        text: text,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-        },
-      }
-    );
-  } catch (error) {
-    console.error('Error logging responses:', error.message);
-  }
-}
+  // Prevent relay of messages sent by the bot
+  if (bot_id) return;
 
-async function analyzeAndLogConnections() {
-  if (allUsers.length < 2) return; // Need at least two users to find connections
+  if (channelMapping.has(channel)) {
+    const { user: initiatingUser, partner, relayChannel } = channelMapping.get(channel);
 
-  for (let i = 0; i < allUsers.length; i++) {
-    for (let j = i + 1; j < allUsers.length; j++) {
-      const user1 = allUsers[i];
-      const user2 = allUsers[j];
+    // Relay the message to the other channel with the receiving user's mention
+    const relayMessage = `<@${partner}> Your partner sent: \n "${text}" `;
+    await sendMessageToChannel(relayChannel, relayMessage);
+    
+    // Store the message in the log
+    if (!messageLogs.has(channel)) {
+      messageLogs.set(channel, []);
+    }
+    messageLogs.get(channel).push(`User <@${initiatingUser}> sent: "${text}"`);
 
-      const userPairKey = `${user1.userId}:${user2.userId}`; // Unique key for each pair
+    if (!messageLogs.has(relayChannel)) {
+      messageLogs.set(relayChannel, []);
+    }
+    messageLogs.get(relayChannel).push(`User <@${initiatingUser}> sent: "${text}"`);
 
-      if (!matchedPairs.has(userPairKey) && user1.userId !== user2.userId) {
-        const user1Answers = user1.answers.join(' ');
-        const user2Answers = user2.answers.join(' ');
-
-        const matchResult = await getMatchPercentage(user1Answers, user2Answers);
-
-        if (matchResult && parseInt(matchResult.match(/(\d+)%/)[1], 10) >= 60) {
-          const uniqueChannelName = generateValidChannelName();
-          
-          await createPrivateChannelsAndNotify(user1.userId, user2.userId, uniqueChannelName, matchResult);
-          
-          matchedPairs.add(userPairKey); // Mark this pair as matched
-          matchedPairs.add(`${user2.userId}:${user1.userId}`); // Also mark the reverse pair as matched
-        }
-      }
+    // Check for ':end:' in the message content
+    if (text.includes(':end:')) {
+      await endConversation(initiatingUser);
     }
   }
 }
 
+async function handleAdminLogRequest(event) {
+  const { user, text } = event;
+  if (user === 'U062U3SQ2T1' && text.startsWith('anon-meet-')) {
+    const channelName = text.trim();
+    let logs = [];
+
+    for (const [channelId, messages] of messageLogs.entries()) {
+      if (channelId.includes(channelName)) {
+        logs = logs.concat(messages);
+      }
+    }
+
+    if (logs.length > 0) {
+      await sendDM(user, `Logs for channel ${channelName}:\n\n${logs.join('\n')}`);
+    } else {
+      await sendDM(user, `No logs found for channel ${channelName}.`);
+    }
+  }
+}
+
+// Function to get match percentage using OpenAI
 async function getMatchPercentage(user1Answers, user2Answers) {
   try {
-    const response = await fetch('https://jamsapi.hackclub.dev/openai/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_TOKEN}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
-        messages: [
-          {
-            role: 'user',
-            content: `Compare the following user interests and provide a match percentage based on shared interests. Focus on positive matches:
+    const response = await axios.post('https://jamsapi.hackclub.dev/openai/chat/completions', {
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'user',
+          content: `Compare the following user interests and provide a match percentage based on shared interests. Focus on positive matches but also make sure that the matches make sense and they actually have something in common:
 
 User 1: ${user1Answers}
 User 2: ${user2Answers}
 
 Provide the match percentage and reasons for the match.`,
-          },
-        ],
-      })
+        },
+      ],
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_TOKEN}`,
+      },
     });
 
-    const data = await response.json();
+    const data = response.data;
     return data.choices[0].message.content;
   } catch (error) {
     console.error('Error calling OpenAI API:', error.message);
     return null;
+  }
+}
+
+async function analyzeAndLogConnections() {
+  try {
+    const allUsers = await getAllUserResponses(); // Retrieve all user responses from the database
+    if (allUsers.length < 2) return; // Need at least two users to find connections
+
+    for (let i = 0; i < allUsers.length; i++) {
+      for (let j = i + 1; j < allUsers.length; j++) {
+        const user1 = allUsers[i];
+        const user2 = allUsers[j];
+
+        const userPairKey = `${user1.userId}:${user2.userId}`; // Unique key for each pair
+
+        if (!matchedPairs.has(userPairKey) && user1.userId !== user2.userId) {
+          const user1Answers = user1.answers.join(' ');
+          const user2Answers = user2.answers.join(' ');
+
+          const matchResult = await getMatchPercentage(user1Answers, user2Answers);
+
+          if (matchResult && parseInt(matchResult.match(/(\d+)%/)[1], 10) >= 60) {
+            const uniqueChannelName = generateValidChannelName();
+            
+            await createPrivateChannelsAndNotify(user1.userId, user2.userId, uniqueChannelName, matchResult);
+            
+            matchedPairs.add(userPairKey); // Mark this pair as matched
+            matchedPairs.add(`${user2.userId}:${user1.userId}`); // Also mark the reverse pair as matched
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error analyzing and logging connections:', error.message);
   }
 }
 
@@ -249,13 +286,13 @@ async function createPrivateChannelsAndNotify(user1Id, user2Id, baseChannelName,
     await inviteUserToChannel(channelIdB, user2Id);
 
     // Notify both users with match reason and instructions
-    const matchMessage = `Hey! There's a match for you! Use this channel to communicate anonymously.\n\n*Match Reason:*\n${matchResult}\n\nTo end the conversation and reveal the identity of your partner, react to this message with :end: or include ':end:' in your message. The conversation will end, and both identities will be revealed. The channel will be archived automatically in 24 hours if no action is taken.`;
+    const matchMessage = `Hey! There's a match for you! You can talk to them in this channel anonymously.\n\n*Match Reason:*\n${matchResult}\n\nTo stop talking and reveal the identity of your partner, react to this message with :end: or include ':end:' in your message. The conversation will end, and both people will be revealed. The channel will be archived automatically in 24 hours afterward. \n While you're here, why not join <#${THE_HEN_COOP_CHANNEL_ID}|the-hen-coop>?`;
 
     await sendMessageToChannel(channelIdA, matchMessage);
     await sendMessageToChannel(channelIdB, matchMessage);
 
-    await sendDM(user1Id, `Hey, there's a match for you! You can talk to the person in <#${channelIdA}>.\n\n*Match Reason:*\n${matchResult}\n\nTo end the conversation and reveal the identity of your partner, react to this message with :end: or include ':end:' in your message. The conversation will end, and both identities will be revealed. The channel will be archived automatically in 24 hours if no action is taken.`);
-    await sendDM(user2Id, `Hey, there's a match for you! You can talk to the person in <#${channelIdB}>.\n\n*Match Reason:*\n${matchResult}\n\nTo end the conversation and reveal the identity of your partner, react to this message with :end: or include ':end:' in your message. The conversation will end, and both identities will be revealed. The channel will be archived automatically in 24 hours if no action is taken.`);
+    await sendDM(user1Id, `Hey, there's a match for you! You can talk to the person in <#${channelIdA}>.\n\n*Match Reason:*\n${matchResult}\n\nTo stop talking and reveal the identity of your partner, react to this message with :end: or include ':end:' in your message. The conversation will end and both people will be revealed. The channel will be archived automatically in 24 hours afterward. \n  While you're here, why not join <#${THE_HEN_COOP_CHANNEL_ID}|the-hen-coop>?`);
+    await sendDM(user2Id, `Hey, there's a match for you! You can talk to the person in <#${channelIdB}>.\n\n*Match Reason:*\n${matchResult}\n\nTo stop talking and reveal the identity of your partner, react to this message with :end: or include ':end:' in your message. The conversation will end and both people will be revealed. The channel will be archived automatically in 24 hours afterward. \n  While you're here, why not join <#${THE_HEN_COOP_CHANNEL_ID}|the-hen-coop>?`);
 
     // Start archive timer with hourly updates
     startArchiveTimer(channelIdA, channelIdB, user1Id, user2Id, ARCHIVE_AFTER_HOURS);
@@ -279,8 +316,8 @@ async function startArchiveTimer(channelIdA, channelIdB, user1Id, user2Id, hours
 
 async function archiveChannels(channelIdA, channelIdB, user1Id, user2Id) {
   // Notify users before archiving
-  await sendMessageToChannel(channelIdA, `The conversation is now being archived. Your partner was <@${user2Id}>.`);
-  await sendMessageToChannel(channelIdB, `The conversation is now being archived. Your partner was <@${user1Id}>.`);
+  await sendMessageToChannel(channelIdA, `The conversation is now being archived. Your partner was <@${user2Id}>. \n Tell us how we can make it better! #anon-meet `);
+  await sendMessageToChannel(channelIdB, `The conversation is now being archived. Your partner was <@${user1Id}>. \n Tell us how we can make it better! #anon-meet `);
 
   // Archive both channels
   await archiveChannel(channelIdA);
@@ -363,30 +400,6 @@ async function sendDM(userId, text) {
   }
 }
 
-async function handleMessageEvent(event) {
-  const { channel, user, text, bot_id } = event;
-
-  // Prevent relay of messages sent by the bot
-  if (bot_id) return;
-
-  if (channelMapping.has(channel)) {
-    const { user: initiatingUser, partner, relayChannel } = channelMapping.get(channel);
-
-    // Relay the message to the other channel with the receiving user's mention
-    const relayMessage = `${text} - <@${partner}>`;
-    await sendMessageToChannel(relayChannel, relayMessage);
-    
-    // Log the message exchange in the #anon-logs channel
-    const logText = `User <@${initiatingUser}> sent "${text}" to channel <#${relayChannel}>`;
-    await sendMessageToChannel(ANON_LOGS_CHANNEL, logText);
-
-    // Check for ':end:' in the message content
-    if (text.includes(':end:')) {
-      await endConversation(initiatingUser);
-    }
-  }
-}
-
 async function handleEndReaction(event) {
   const { item: { channel, ts }, user, item_user } = event;
 
@@ -438,14 +451,67 @@ async function endConversation(initiatingUserId) {
     if (user === initiatingUserId) {
       const targetUser = partner;
 
-      // Notify users of ending and set a timer to archive in 1 hour
-      await sendMessageToChannel(channelId, `The conversation will end now. Your partner was <@${targetUser}>. The channel will be archived in 1 hour.`);
-      await sendMessageToChannel(relayChannel, `The conversation will end now. Your partner was <@${initiatingUserId}>. The channel will be archived in 1 hour.`);
+      // Notify users of ending and set a timer to archive in 24 hours
+      await sendMessageToChannel(channelId, `The conversation will end now. Your partner was <@${targetUser}>. The channel will be archived in 24 hours.`);
+      await sendMessageToChannel(relayChannel, `The conversation will end now. Your partner was <@${initiatingUserId}>. The channel will be archived in 24 hours.`);
 
-      setTimeout(() => archiveChannels(channelId, relayChannel, initiatingUserId, targetUser), ARCHIVE_TIMER_INTERVAL);
+      setTimeout(() => archiveChannels(channelId, relayChannel, initiatingUserId, targetUser), ARCHIVE_TIMER_INTERVAL * 24);
 
       break;
     }
+  }
+}
+
+// Function to add user to the user group
+async function addUserToUserGroup(userId) {
+  try {
+    // Fetch the current users in the group first
+    const getCurrentUsersResponse = await axios.get(
+      'https://slack.com/api/usergroups.users.list', 
+      {
+        params: {
+          usergroup: ANON_MEETERS_USERGROUP  // Your actual user group ID for @anon-meeters
+        },
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        },
+      }
+    );
+
+    let currentUsers = [];
+
+    if (getCurrentUsersResponse.data.ok) {
+      currentUsers = getCurrentUsersResponse.data.users;
+    } else {
+      console.error('Error fetching current user group members:', getCurrentUsersResponse.data.error);
+    }
+
+    // Add the new user ID to the list
+    currentUsers.push(userId);
+
+    // Update the user group with the new list of users
+    const response = await axios.post(
+      'https://slack.com/api/usergroups.users.update',
+      {
+        usergroup: ANON_MEETERS_USERGROUP,  // Your actual user group ID for @anon-meeters
+        users: currentUsers.join(','),  // Join user IDs into a comma-separated string
+      },
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        },
+      }
+    );
+
+    if (!response.data.ok) {
+      console.error('Error adding user to user group:', response.data.error);
+    } else {
+      console.log(`Successfully added user <@${userId}> to the @anon-meeters group.`);
+    }
+  } catch (error) {
+    console.error('Error adding user to user group:', error.message);
   }
 }
 
